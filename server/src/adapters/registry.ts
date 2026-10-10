@@ -23,6 +23,15 @@ import {
   parseSetupTokenCredential,
 } from "@paperclipai/adapter-claude-local/server";
 import {
+  execute as antigravityExecute,
+  testEnvironment as antigravityTestEnvironment,
+  sessionCodec as antigravitySessionCodec,
+} from "@paperclipai/adapter-antigravity-local/server";
+import {
+  agentConfigurationDoc as antigravityAgentConfigurationDoc,
+  models as antigravityModels,
+} from "@paperclipai/adapter-antigravity-local";
+import {
   agentConfigurationDoc as claudeAgentConfigurationDoc,
   models as claudeModels,
 } from "@paperclipai/adapter-claude-local";
@@ -249,6 +258,20 @@ const grokLoginCapability: AdapterLoginCapability = {
     const prompt = parseGrokDeviceLoginPrompt(output);
     return prompt ? { url: prompt.url, code: prompt.code } : null;
   },
+};
+
+const antigravityLocalAdapter: ServerAdapterModule = {
+  type: "antigravity_local",
+  runtimeToolDelivery: "environment",
+  execute: antigravityExecute,
+  testEnvironment: antigravityTestEnvironment,
+  sessionCodec: antigravitySessionCodec,
+  sessionManagement: getAdapterSessionManagement("antigravity_local") ?? undefined,
+  models: antigravityModels,
+  supportsLocalAgentJwt: true,
+  supportsInstructionsBundle: true,
+  instructionsPathKey: "instructionsFilePath",
+  agentConfigurationDoc: antigravityAgentConfigurationDoc,
 };
 
 const claudeLocalAdapter: ServerAdapterModule = {
@@ -892,6 +915,7 @@ const pausedOverrides = new Set<string>();
 function registerBuiltInAdapters() {
   for (const adapter of [
     acpxLocalAdapter,
+    antigravityLocalAdapter,
     claudeLocalAdapter,
     codexLocalAdapter,
     paperclipRunnerAdapter,
