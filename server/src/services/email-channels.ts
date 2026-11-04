@@ -1,5 +1,8 @@
+import type { ConnectionManagementContext } from "./connection-management.js";
 import { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { fastResponseService, enqueueFastResponse, fastResponseSourceCurrent, fastResponseTurnQueued } from "./fast-responses.js";
+import { fastResponseRequests } from "@paperclipai/db";
 import { HttpError } from "../errors.js";
 import { createHash, randomUUID } from "node:crypto";
 import WebSocket from "ws";
@@ -45,6 +48,7 @@ import { resolveExecutionWorkspaceEnvironmentId } from "./execution-workspace-po
 import { emailConnectionService } from "./email-connections.js";
 import { secretService } from "./secrets.js";
 import { authorizationService } from "./authorization.js";
+import { assertChatTaskCreationAccess, resolveChatExecutionDefaults } from "./chat-execution-defaults.js";
 import { issueService } from "./issues.js";
 import { logActivity } from "./activity-log.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -69,6 +73,7 @@ import {
 } from "./agentmail-api.js";
 
 export type EmailActor = {
+  managementContext?: ConnectionManagementContext;
   userId?: string;
   agentId?: string;
   runId?: string;
@@ -274,6 +279,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
       companyId: endpoint.companyId,
       actorType: actor.agentId ? "agent" : actor.userId ? "user" : "system",
       actorId: actor.agentId ?? actor.userId ?? "agentmail",
+      ...actor.managementContext?.audit,
       action,
       entityType: "tool_connection",
       entityId: endpoint.connectionId,
@@ -624,6 +630,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
     input: EmailEndpointSetupInput,
     actor: EmailActor,
   ) {
+    await actor.managementContext?.reauthorize();
     const [agent] = await db
       .select()
       .from(agents)
@@ -681,6 +688,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
     )
       throw conflict("Setup request already belongs to another inbox");
     if (!endpoint) {
+      await actor.managementContext?.reauthorize();
       const applicationId = input.applicationId ?? randomUUID();
       const connectionId = randomUUID();
       await db.transaction(async (tx) => {
@@ -722,6 +730,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           authKind: "api_key",
           ownership: "customer",
           credentialPolicy: "shared",
+          createdByUserId: actor.userId ?? null,
           status: "draft",
           enabled: false,
           config: { provider: "agentmail" },
@@ -828,6 +837,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           });
       if (scope.scope_type === "inbox" && scope.inbox_id !== inbox.inbox_id)
         throw forbidden("API key belongs to a different inbox");
+      await actor.managementContext?.reauthorize();
       await db
         .update(chatEndpoints)
         .set({
@@ -848,6 +858,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
       if (!config.ownedApiKeyId && scope.scope_type !== "inbox") {
         const key = await api.createInboxKey(inbox.inbox_id);
         try {
+          await actor.managementContext?.reauthorize();
           await vault(endpoint, "apiKey", key.api_key);
           await db
             .update(emailEndpoints)
@@ -878,6 +889,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           );
         const webhook = await createWebhook({ ...endpoint, botExternalId: inbox.inbox_id }, api);
         try {
+          await actor.managementContext?.reauthorize();
           await vault(endpoint, "webhookSecret", webhook.secret);
           await db
             .update(emailEndpoints)
@@ -888,6 +900,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           throw error;
         }
       }
+      await actor.managementContext?.reauthorize();
       const now = new Date();
       await db.transaction(async (tx) => {
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.email);
@@ -1315,22 +1328,42 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         }
         if (!conversation) {
           const placement = await inboundPlacement(
-            endpoint.companyId,
-            endpoint.assignedAgentId,
+            current.companyId,
+            current.assignedAgentId,
           );
+          const defaults = resolveChatExecutionDefaults(current.executionDefaults, null);
+          if ("projectId" in placement && defaults.projectId !== undefined && defaults.projectId !== placement.projectId) {
+            throw forbidden("Default project conflicts with the assigned agent's trust boundary");
+          }
+          await assertChatTaskCreationAccess(db, {
+            companyId: current.companyId,
+            assigneeAgentId: current.assignedAgentId,
+            actor: current.sponsorUserId ? { type: "board", userId: current.sponsorUserId, source: "session", ignoreInstanceAdmin: true } : { type: "none" },
+            defaults: { ...defaults, ...("projectId" in placement ? { projectId: placement.projectId } : {}) },
+            parentIssueId: "parentId" in placement ? placement.parentId : null,
+          }, tx);
+          await assertChatTaskCreationAccess(db, {
+            companyId: current.companyId,
+            assigneeAgentId: current.assignedAgentId,
+            actor: { type: "agent", agentId: current.assignedAgentId, companyId: current.companyId, onBehalfOfUserId: current.sponsorUserId, source: "agent_key" },
+            defaults: { ...defaults, ...("projectId" in placement ? { projectId: placement.projectId } : {}) },
+            parentIssueId: "parentId" in placement ? placement.parentId : null,
+          }, tx);
           const task = await issueService(db).create(
-            endpoint.companyId,
+            current.companyId,
             {
+              ...(defaults.projectId !== undefined ? { projectId: defaults.projectId } : {}),
               ...placement,
+              ...(defaults.workspace ? { workspaceSelection: defaults.workspace, workspaceSelectionSource: "channel" as const } : {}),
               title: message.subject.slice(0, 200),
-              description: `Email conversation for ${endpoint.botExternalId}`,
+              description: `Email conversation for ${current.botExternalId}`,
               status: "todo",
               priority: "medium",
-              assigneeAgentId: endpoint.assignedAgentId,
-              responsibleUserId: endpoint.sponsorUserId,
+              assigneeAgentId: current.assignedAgentId,
+              responsibleUserId: current.sponsorUserId,
               originKind: "chat_channel",
-              originId: `email:${endpoint.id}:${message.thread_id}`,
-              idempotencyKey: `email:${endpoint.id}:${message.thread_id}`,
+              originId: `email:${current.id}:${message.thread_id}`,
+              idempotencyKey: `email:${current.id}:${message.thread_id}`,
             },
             tx,
           );
@@ -1406,6 +1439,10 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
             state: event.wakePending ? "active" : conversation.state,
           })
           .where(eq(chatConversations.id, conversation.id));
+        if (event.wakePending && link?.commentId) await enqueueFastResponse(tx as unknown as Db, {
+          companyId: endpoint.companyId, issueId: task.id, agentId: endpoint.assignedAgentId, responsibleUserId: null, sponsored: true,
+          sourceKey: `comment:${link.commentId}`, sourceCommentId: link.commentId, acceptedAt: new Date(), endpointId: endpoint.id, conversationId: conversation.id, deliveryId: delivery.id,
+        });
       });
     }
     if (event.wakePending && event.issueId) {
@@ -1452,6 +1489,32 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
       })
       .where(eq(chatDeliveries.id, delivery.id));
   }
+  async function authorizeFastResponse(tx: Db, request: typeof fastResponseRequests.$inferSelect) {
+    const [endpoint] = await tx.select().from(chatEndpoints).where(and(eq(chatEndpoints.companyId, request.companyId), eq(chatEndpoints.id, request.endpointId!)));
+    if (!endpoint || endpoint.provider !== "agentmail" || endpoint.status !== "active" || endpoint.assignedAgentId !== request.agentId || !endpoint.sponsorUserId) throw forbidden();
+    await active(endpoint);
+    await authorize(endpoint, request.issueId!, { userId: endpoint.sponsorUserId, localImplicit: endpoint.sponsorUserId === "local-board" });
+    const [link] = await tx.select().from(chatMessageLinks).where(and(eq(chatMessageLinks.companyId, request.companyId), eq(chatMessageLinks.deliveryId, request.deliveryId!), eq(chatMessageLinks.commentId, request.sourceCommentId!), eq(chatMessageLinks.direction, "inbound")));
+    if (!link || link.endpointId !== request.endpointId || link.conversationId !== request.conversationId) throw forbidden();
+    const [message] = await tx.select().from(emailMessages).where(and(eq(emailMessages.companyId, request.companyId), eq(emailMessages.endpointId, request.endpointId!), eq(emailMessages.providerMessageId, link.providerMessageId)));
+    if (!message || message.automatic || message.direction !== "inbound") throw forbidden();
+    const [agent] = await tx.select({ name: agents.name }).from(agents).where(and(eq(agents.companyId, request.companyId), eq(agents.id, request.agentId!)));
+    return { agentName: agent?.name ?? "Assistant", message: message.text, queued: await fastResponseTurnQueued(tx, request) };
+  }
+  async function publishFastResponse(tx: Db, request: typeof fastResponseRequests.$inferSelect, commentId: string, text: string) {
+    await authorizeFastResponse(tx, request);
+    const [endpoint] = await tx.select().from(chatEndpoints).where(eq(chatEndpoints.id, request.endpointId!));
+    const [link] = await tx.select().from(chatMessageLinks).where(and(eq(chatMessageLinks.companyId, request.companyId), eq(chatMessageLinks.deliveryId, request.deliveryId!), eq(chatMessageLinks.commentId, request.sourceCommentId!)));
+    const input: EmailSendInput = { endpointId: endpoint.id, conversationId: request.conversationId!, replyToMessageId: link.providerMessageId, replyAll: false,
+      text, attachmentIds: [], idempotencyKey: request.id };
+    const actor = { userId: endpoint.sponsorUserId!, localImplicit: endpoint.sponsorUserId === "local-board" };
+    await policy(endpoint, input, actor, true);
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.email);
+    await tx.insert(chatPublications).values({ id: request.id, companyId: request.companyId, endpointId: endpoint.id, conversationId: request.conversationId!, issueId: request.issueId!, commentId,
+      idempotencyKey: `fast-response:${request.id}`, payload: { text } });
+    await tx.insert(emailSends).values({ companyId: request.companyId, endpointId: endpoint.id, publicationId: request.id, request: input, actor, digest: hash({ input, actor }) });
+  }
+
   async function queueSend(
     companyId: string,
     input: EmailSendInput,
@@ -1648,6 +1711,22 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         .where(eq(chatPublications.id, pub.id));
       return;
     }
+    const fastResponseEligible = async () => {
+      if (!pub.idempotencyKey.startsWith("fast-response:")) return true;
+      return db.transaction(async tx => {
+        const [request] = await tx.select().from(fastResponseRequests).where(and(eq(fastResponseRequests.id, pub.id), eq(fastResponseRequests.companyId, pub.companyId)));
+        if (!request || !(await fastResponseSourceCurrent(tx as unknown as Db, request))) return false;
+        try { await fastResponseService(tx as unknown as Db).authorize(tx as unknown as Db, request); await authorizeFastResponse(tx as unknown as Db, request); return request.expiresAt.getTime() > Date.now(); } catch { return false; }
+      });
+    };
+    if (pub.idempotencyKey.startsWith("fast-response:") && send.firstAttemptAt) {
+      await db.update(chatPublications).set({ state: "delivery_unknown", redactedError: "Fast response delivery needs reconciliation" }).where(eq(chatPublications.id, pub.id));
+      return;
+    }
+    if (!(await fastResponseEligible())) {
+      await db.update(chatPublications).set({ state: "cancelled" }).where(eq(chatPublications.id, pub.id));
+      return;
+    }
     const input = send.request;
     let attempted = false;
     try {
@@ -1751,6 +1830,10 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         throw badRequest("The reply has no external recipient");
       await active(endpoint);
       await fence();
+      if (!(await fastResponseEligible())) {
+        await db.update(chatPublications).set({ state: "cancelled" }).where(eq(chatPublications.id, pub.id));
+        return;
+      }
       attempted = true;
       const result = await api.send(
         endpoint.botExternalId!,
@@ -2302,6 +2385,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
     action: "pause" | "resume" | "remove",
     actor: EmailActor,
   ) {
+    await actor.managementContext?.reauthorize();
     const endpoint = await getEndpoint(id);
     const result = await withLease(endpoint, async () => {
       const config = await getConfig(id);
@@ -2314,6 +2398,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           endpoint.botExternalId!,
         );
       }
+      await actor.managementContext?.reauthorize();
       if (action !== "resume") await stopEndpoint(endpoint);
       let cleanupError: string | null = null;
       if (action === "remove") {
@@ -2404,6 +2489,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
     receiveMode: "websocket" | "webhook",
     actor: EmailActor,
   ) {
+    await actor.managementContext?.reauthorize();
     const endpoint = await getEndpoint(id);
     if (endpoint.status === "archived" || !endpoint.botExternalId)
       throw conflict("Create a new inbox connection");
@@ -2415,6 +2501,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
     )
       throw forbidden("API key belongs to a different inbox");
     await api.getInbox(endpoint.botExternalId);
+    await actor.managementContext?.reauthorize();
     const result = await withLease(endpoint, async () => {
       const config = await getConfig(id);
       // Check registration permissions before interrupting a working socket.
@@ -2423,6 +2510,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         : null;
       if (preparedWebhook) {
         try {
+          await actor.managementContext?.reauthorize();
           await vault(endpoint, "webhookSecret", preparedWebhook.secret);
           await db.update(emailEndpoints).set({ webhookId: preparedWebhook.webhook_id })
             .where(eq(emailEndpoints.endpointId, id));
@@ -2431,6 +2519,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           throw error;
         }
       }
+      await actor.managementContext?.reauthorize();
       await stopEndpoint(endpoint);
       // Only registrations and scoped keys created by Paperclip are removed.
       if (config.webhookId)
@@ -2648,12 +2737,15 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
     setup,
     getEndpoint,
     summary,
+    authorizeFastResponse,
+    publishFastResponse,
     queueSend,
     publication,
     thread,
     webhook,
     admit,
     tick,
+    async flushPublications() { await activeTick; await tick(); },
     control,
     reconnect,
     resolveUncertain,
